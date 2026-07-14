@@ -1,0 +1,31 @@
+---
+# Optional helper: give every managed node its inventory identity.
+#
+# - Sets each node's hostname from its inventory name (single source of
+#   truth: the inventory).
+# - Distributes an /etc/hosts block mapping every inventory host's
+#   ansible_host IP to its name, so nodes resolve each other without an
+#   internal DNS zone. Both caching mechanisms honor /etc/hosts
+#   (systemd-resolved via ReadEtcHosts=yes; dnsmasq by default), so the
+#   entries are served through the local caches immediately — no restarts.
+#
+# For anything beyond a small lab, prefer an internal authoritative DNS
+# zone with split-DNS routing over /etc/hosts distribution.
+
+- name: Set hostnames and distribute host entries
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Set each node's hostname from its inventory name
+      ansible.builtin.hostname:
+        name: "{{ inventory_hostname }}"
+
+    - name: Distribute all inventory host entries to /etc/hosts
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        marker: "# {mark} ANSIBLE MANAGED LAB HOSTS"
+        block: |
+          {% for host in groups['all'] %}
+          {{ hostvars[host].ansible_host }} {{ host }}
+          {% endfor %}

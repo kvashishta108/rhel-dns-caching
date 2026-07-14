@@ -1,0 +1,303 @@
+---
+# =============================================================================
+# dns-caching.yml
+#
+# Configures localized (loopback-only) DNS caching across a mixed RHEL 9 /
+# RHEL 10 estate, using the vendor-supported mechanism for each release:
+#
+#   RHEL 9  -> NetworkManager-managed dnsmasq (dns=dnsmasq)
+#              systemd-resolved is an *unsupported Technology Preview* on
+#              RHEL 9; Red Hat's documented, supported local-caching method
+#              is the NetworkManager dnsmasq DNS plugin. NM spawns dnsmasq
+#              bound to 127.0.0.1:53, writes "nameserver 127.0.0.1" into
+#              /etc/resolv.conf, and forwards to the upstream servers defined
+#              in each connection profile (static or DHCP-provided).
+#
+#   RHEL 10 -> systemd-resolved (fully supported since RHEL 10.0)
+#              The stub resolver listens on 127.0.0.53:53, caches replies,
+#              and integrates with NetworkManager per-link DNS settings.
+#              NOTE: DNSSEC *validation* in systemd-resolved is still a
+#              Technology Preview in RHEL 10, so it is disabled by default
+#              below (override via dns_cache_resolved_dnssec).
+#
+# Upstream DNS servers are NOT overridden by this playbook on either OS —
+# both mechanisms consume whatever DNS the NetworkManager connection
+# profiles already carry (DHCP or static), so this is safe to roll out
+# without touching your existing resolver topology.
+#
+# Usage:
+#   ansible-playbook -i inventory dns-caching.yml
+#
+# Requires: ansible-core >= 2.14, collections ansible.posix (not strictly
+# needed) and community.general are NOT required — only builtin modules used.
+# =============================================================================
+
+- name: Configure localized DNS caching on RHEL 9 and RHEL 10
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # --- shared tunables ----------------------------------------------------
+    # dnsmasq cache entries (RHEL 9). NM's embedded default is only 400.
+    dns_cache_dnsmasq_cache_size: 10000
+    # Cache negative (NXDOMAIN) answers on RHEL 9? Usually yes.
+    dns_cache_dnsmasq_negcache: true
+
+    # systemd-resolved settings (RHEL 10)
+    dns_cache_resolved_cache: "yes"          # Cache=  (yes | no | no-negative)
+    dns_cache_resolved_dnssec: "no"          # DNSSEC validation is Tech Preview
+                                             # on RHEL 10 -> keep off in prod,
+                                             # or set "allow-downgrade" to test.
+    dns_cache_resolved_dnsovertls: "no"      # set "opportunistic" if desired
+    dns_cache_resolved_read_etc_hosts: "yes"
+
+    # Test name used by the post-configuration verification step
+    dns_cache_test_hostname: redhat.com
+
+  pre_tasks:
+    - name: Assert host is RHEL-family 9 or 10
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == 'RedHat'
+          - ansible_facts['distribution_major_version'] in ['9', '10']
+        fail_msg: >-
+          Unsupported platform:
+          {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}.
+          This playbook targets RHEL (or rebuild) major versions 9 and 10 only.
+
+  tasks:
+    # =========================================================================
+    # RHEL 9 — NetworkManager + dnsmasq (Red Hat's supported caching method)
+    # =========================================================================
+    - name: RHEL 9 | Configure DNS caching via NetworkManager dnsmasq plugin
+      when: ansible_facts['distribution_major_version'] == '9'
+      block:
+
+        - name: RHEL 9 | Install dnsmasq (required by NetworkManager dns=dnsmasq)
+          ansible.builtin.dnf:
+            name: dnsmasq
+            state: present
+
+        - name: RHEL 9 | Ensure standalone dnsmasq.service is disabled and stopped
+          # NetworkManager spawns and supervises its own dnsmasq instance on
+          # 127.0.0.1:53; a standalone unit would fight it for port 53.
+          ansible.builtin.systemd_service:
+            name: dnsmasq.service
+            state: stopped
+            enabled: false
+
+        - name: RHEL 9 | Ensure systemd-resolved is not active (Tech Preview on RHEL 9)
+          ansible.builtin.systemd_service:
+            name: systemd-resolved.service
+            state: stopped
+            enabled: false
+          failed_when: false   # unit may not exist at all on a minimal install
+
+        - name: RHEL 9 | Point NetworkManager at the dnsmasq DNS plugin
+          ansible.builtin.copy:
+            dest: /etc/NetworkManager/conf.d/00-dns-caching.conf
+            owner: root
+            group: root
+            mode: "0644"
+            content: |
+              # Managed by Ansible (dns-caching.yml) — do not edit by hand.
+              # NetworkManager launches a private dnsmasq bound to 127.0.0.1:53,
+              # writes "nameserver 127.0.0.1" to /etc/resolv.conf, and forwards
+              # to the DNS servers defined in the connection profiles.
+              [main]
+              dns=dnsmasq
+          notify: Reload NetworkManager
+
+        - name: RHEL 9 | Tune the NetworkManager-managed dnsmasq instance
+          ansible.builtin.copy:
+            dest: /etc/NetworkManager/dnsmasq.d/00-cache-tuning.conf
+            owner: root
+            group: root
+            mode: "0644"
+            content: |
+              # Managed by Ansible (dns-caching.yml) — do not edit by hand.
+              # NM's embedded dnsmasq defaults to a 400-entry cache; raise it.
+              cache-size={{ dns_cache_dnsmasq_cache_size }}
+              # Never forward queries for plain names (no dots) upstream.
+              domain-needed
+              # Never forward reverse lookups for private ranges upstream.
+              bogus-priv
+              {% if not dns_cache_dnsmasq_negcache %}
+              no-negcache
+              {% endif %}
+          notify: Reload NetworkManager
+
+        - name: RHEL 9 | Check whether /etc/resolv.conf is a symlink
+          ansible.builtin.stat:
+            path: /etc/resolv.conf
+            follow: false
+          register: resolvconf_stat
+
+        - name: RHEL 9 | Remove stale resolv.conf symlink so NM can manage the file
+          # If a previous experiment left resolv.conf symlinked to
+          # systemd-resolved's stub file, remove the symlink so NetworkManager
+          # can regenerate a regular file with "nameserver 127.0.0.1".
+          ansible.builtin.file:
+            path: /etc/resolv.conf
+            state: absent
+          when: resolvconf_stat.stat.islnk | default(false)
+          notify: Reload NetworkManager
+
+      rescue:
+        - name: RHEL 9 | Fail with context
+          ansible.builtin.fail:
+            msg: >-
+              RHEL 9 dnsmasq caching configuration failed on
+              {{ inventory_hostname }}. Check NetworkManager journal:
+              journalctl -u NetworkManager --since -10min
+
+    # =========================================================================
+    # RHEL 10 — systemd-resolved (fully supported since 10.0)
+    # =========================================================================
+    - name: RHEL 10 | Configure DNS caching via systemd-resolved
+      when: ansible_facts['distribution_major_version'] == '10'
+      block:
+
+        - name: RHEL 10 | Install systemd-resolved (separate package on RHEL 10)
+          ansible.builtin.dnf:
+            name: systemd-resolved
+            state: present
+
+        - name: RHEL 10 | Ensure no conflicting standalone caches hold port 53
+          ansible.builtin.systemd_service:
+            name: "{{ item }}"
+            state: stopped
+            enabled: false
+          loop:
+            - dnsmasq.service
+            - unbound.service
+            - nscd.service
+          failed_when: false   # units are typically absent; that is fine
+
+        - name: RHEL 10 | Drop in resolved caching configuration
+          ansible.builtin.file:
+            path: /etc/systemd/resolved.conf.d
+            state: directory
+            owner: root
+            group: root
+            mode: "0755"
+
+        - name: RHEL 10 | Write /etc/systemd/resolved.conf.d/10-dns-caching.conf
+          ansible.builtin.copy:
+            dest: /etc/systemd/resolved.conf.d/10-dns-caching.conf
+            owner: root
+            group: root
+            mode: "0644"
+            content: |
+              # Managed by Ansible (dns-caching.yml) — do not edit by hand.
+              # Upstream servers come from NetworkManager per-link settings
+              # (DHCP or static); we deliberately do not set DNS= here.
+              [Resolve]
+              Cache={{ dns_cache_resolved_cache }}
+              CacheFromLocalhost=no
+              # DNSSEC validation is a Technology Preview on RHEL 10 —
+              # disabled by default; set to allow-downgrade to evaluate.
+              DNSSEC={{ dns_cache_resolved_dnssec }}
+              DNSOverTLS={{ dns_cache_resolved_dnsovertls }}
+              DNSStubListener=yes
+              ReadEtcHosts={{ dns_cache_resolved_read_etc_hosts }}
+          notify: Restart systemd-resolved
+
+        - name: RHEL 10 | Enable and start systemd-resolved
+          ansible.builtin.systemd_service:
+            name: systemd-resolved.service
+            state: started
+            enabled: true
+
+        - name: RHEL 10 | Tell NetworkManager to use systemd-resolved
+          ansible.builtin.copy:
+            dest: /etc/NetworkManager/conf.d/00-dns-caching.conf
+            owner: root
+            group: root
+            mode: "0644"
+            content: |
+              # Managed by Ansible (dns-caching.yml) — do not edit by hand.
+              # Push per-connection DNS servers into systemd-resolved so the
+              # stub resolver on 127.0.0.53 forwards and caches for them.
+              [main]
+              dns=systemd-resolved
+          notify: Reload NetworkManager
+
+        - name: RHEL 10 | Point /etc/resolv.conf at the resolved stub file
+          # stub-resolv.conf lists 127.0.0.53 plus the correct search domains;
+          # this is the systemd-recommended mode of operation.
+          ansible.builtin.file:
+            src: /run/systemd/resolve/stub-resolv.conf
+            dest: /etc/resolv.conf
+            state: link
+            force: true
+            follow: false
+          notify: Reload NetworkManager
+
+      rescue:
+        - name: RHEL 10 | Fail with context
+          ansible.builtin.fail:
+            msg: >-
+              RHEL 10 systemd-resolved configuration failed on
+              {{ inventory_hostname }}. Check:
+              journalctl -u systemd-resolved --since -10min ; resolvectl status
+
+    # =========================================================================
+    # Verification (both versions) — flush handlers first so services are live
+    # =========================================================================
+    - name: Flush handlers so DNS services are (re)started before verification
+      ansible.builtin.meta: flush_handlers
+
+    - name: Verify | Wait briefly for the local resolver to settle
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 53
+        timeout: 30
+      when: ansible_facts['distribution_major_version'] == '9'
+
+    - name: Verify | Wait for the systemd-resolved stub listener
+      ansible.builtin.wait_for:
+        host: 127.0.0.53
+        port: 53
+        timeout: 30
+      when: ansible_facts['distribution_major_version'] == '10'
+
+    - name: Verify | /etc/resolv.conf points at the loopback cache
+      ansible.builtin.command: cat /etc/resolv.conf
+      register: resolv_conf_out
+      changed_when: false
+      failed_when: >
+        ('127.0.0.1' not in resolv_conf_out.stdout) and
+        ('127.0.0.53' not in resolv_conf_out.stdout)
+
+    - name: Verify | Resolve a test name through the local cache
+      ansible.builtin.command: "getent ahosts {{ dns_cache_test_hostname }}"
+      register: getent_out
+      changed_when: false
+      retries: 3
+      delay: 2
+      until: getent_out.rc == 0
+
+    - name: Report | Summarize what was configured
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}
+          -> {{ 'NetworkManager+dnsmasq cache on 127.0.0.1'
+                if ansible_facts['distribution_major_version'] == '9'
+                else 'systemd-resolved stub cache on 127.0.0.53' }};
+          test lookup for {{ dns_cache_test_hostname }} succeeded.
+
+  handlers:
+    - name: Reload NetworkManager
+      # reload (not restart) re-evaluates the DNS plugin and rewrites
+      # /etc/resolv.conf without bouncing interfaces.
+      ansible.builtin.systemd_service:
+        name: NetworkManager.service
+        state: reloaded
+
+    - name: Restart systemd-resolved
+      ansible.builtin.systemd_service:
+        name: systemd-resolved.service
+        state: restarted
