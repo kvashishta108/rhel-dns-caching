@@ -33,9 +33,9 @@
 # =============================================================================
 
 - name: Configure localized DNS caching on RHEL 9 and RHEL 10
-  hosts: all
-  become: true
-  gather_facts: true
+  hosts: all            # target every inventory host; the assert below guards platforms
+  become: true          # root needed for packages, /etc, and systemd
+  gather_facts: true    # explicit: all branching keys on gathered OS facts
 
   vars:
     # --- shared tunables ----------------------------------------------------
@@ -50,12 +50,13 @@
                                              # on RHEL 10 -> keep off in prod,
                                              # or set "allow-downgrade" to test.
     dns_cache_resolved_dnsovertls: "no"      # set "opportunistic" if desired
-    dns_cache_resolved_read_etc_hosts: "yes"
+    dns_cache_resolved_read_etc_hosts: "yes"  # serve /etc/hosts entries via the stub
 
     # Test name used by the post-configuration verification step
     dns_cache_test_hostname: redhat.com
 
   pre_tasks:
+    # Reject unsupported platforms before anything is modified.
     - name: Assert host is RHEL-family 9 or 10
       ansible.builtin.assert:
         that:
@@ -74,6 +75,7 @@
       when: ansible_facts['distribution_major_version'] == '9'
       block:
 
+        # NM's dns=dnsmasq plugin execs /usr/sbin/dnsmasq but doesn't ship it.
         - name: RHEL 9 | Install dnsmasq (required by NetworkManager dns=dnsmasq)
           ansible.builtin.dnf:
             name: dnsmasq
@@ -87,6 +89,7 @@
             state: stopped
             enabled: false
 
+        # Unsupported on RHEL 9, and it would occupy the local-resolver role.
         - name: RHEL 9 | Ensure systemd-resolved is not active (Tech Preview on RHEL 9)
           ansible.builtin.systemd_service:
             name: systemd-resolved.service
@@ -94,6 +97,7 @@
             enabled: false
           failed_when: false   # unit may not exist at all on a minimal install
 
+        # dns=dnsmasq is the single key that activates NM's caching instance.
         - name: RHEL 9 | Point NetworkManager at the dnsmasq DNS plugin
           ansible.builtin.copy:
             dest: /etc/NetworkManager/conf.d/00-dns-caching.conf
@@ -109,6 +113,7 @@
               dns=dnsmasq
           notify: Reload NetworkManager
 
+        # NM's instance reads /etc/NetworkManager/dnsmasq.d/ (not /etc/dnsmasq.d/).
         - name: RHEL 9 | Tune the NetworkManager-managed dnsmasq instance
           ansible.builtin.copy:
             dest: /etc/NetworkManager/dnsmasq.d/00-cache-tuning.conf
@@ -128,6 +133,7 @@
               {% endif %}
           notify: Reload NetworkManager
 
+        # Detect leftovers from a prior systemd-resolved setup (link, not file).
         - name: RHEL 9 | Check whether /etc/resolv.conf is a symlink
           ansible.builtin.stat:
             path: /etc/resolv.conf
@@ -145,6 +151,7 @@
           notify: Reload NetworkManager
 
       rescue:
+        # Any failure above lands here: re-fail with an actionable message.
         - name: RHEL 9 | Fail with context
           ansible.builtin.fail:
             msg: >-
@@ -159,11 +166,13 @@
       when: ansible_facts['distribution_major_version'] == '10'
       block:
 
+        # Split out of the main systemd RPM on RHEL 10 — not installed by default.
         - name: RHEL 10 | Install systemd-resolved (separate package on RHEL 10)
           ansible.builtin.dnf:
             name: systemd-resolved
             state: present
 
+        # Clear the field: only one service may own the local resolver role.
         - name: RHEL 10 | Ensure no conflicting standalone caches hold port 53
           ansible.builtin.systemd_service:
             name: "{{ item }}"
@@ -175,6 +184,7 @@
             - nscd.service
           failed_when: false   # units are typically absent; that is fine
 
+        # Drop-in directory beats editing the RPM-owned resolved.conf.
         - name: RHEL 10 | Drop in resolved caching configuration
           ansible.builtin.file:
             path: /etc/systemd/resolved.conf.d
@@ -183,6 +193,7 @@
             group: root
             mode: "0755"
 
+        # The stub listener on 127.0.0.53:53 is where the caching happens.
         - name: RHEL 10 | Write /etc/systemd/resolved.conf.d/10-dns-caching.conf
           ansible.builtin.copy:
             dest: /etc/systemd/resolved.conf.d/10-dns-caching.conf
@@ -204,12 +215,14 @@
               ReadEtcHosts={{ dns_cache_resolved_read_etc_hosts }}
           notify: Restart systemd-resolved
 
+        # Running now and at boot; config was written first, so first start is correct.
         - name: RHEL 10 | Enable and start systemd-resolved
           ansible.builtin.systemd_service:
             name: systemd-resolved.service
             state: started
             enabled: true
 
+        # NM feeds per-link DNS into resolved via D-Bus — no DNS= needed anywhere.
         - name: RHEL 10 | Tell NetworkManager to use systemd-resolved
           ansible.builtin.copy:
             dest: /etc/NetworkManager/conf.d/00-dns-caching.conf
@@ -236,6 +249,7 @@
           notify: Reload NetworkManager
 
       rescue:
+        # Any failure above lands here: re-fail with an actionable message.
         - name: RHEL 10 | Fail with context
           ansible.builtin.fail:
             msg: >-
@@ -246,9 +260,11 @@
     # =========================================================================
     # Verification (both versions) — flush handlers first so services are live
     # =========================================================================
+    # Handlers normally run at play end; run them NOW so we test live services.
     - name: Flush handlers so DNS services are (re)started before verification
       ansible.builtin.meta: flush_handlers
 
+    # NM forks its dnsmasq child moments after reload — poll instead of racing it.
     - name: Verify | Wait briefly for the local resolver to settle
       ansible.builtin.wait_for:
         host: 127.0.0.1
@@ -256,6 +272,7 @@
         timeout: 30
       when: ansible_facts['distribution_major_version'] == '9'
 
+    # resolved's stub listens on 127.0.0.53, hence a separate wait per branch.
     - name: Verify | Wait for the systemd-resolved stub listener
       ansible.builtin.wait_for:
         host: 127.0.0.53
@@ -263,6 +280,7 @@
         timeout: 30
       when: ansible_facts['distribution_major_version'] == '10'
 
+    # Fail unless applications will be directed at a loopback cache.
     - name: Verify | /etc/resolv.conf points at the loopback cache
       ansible.builtin.command: cat /etc/resolv.conf
       register: resolv_conf_out
@@ -271,6 +289,7 @@
         ('127.0.0.1' not in resolv_conf_out.stdout) and
         ('127.0.0.53' not in resolv_conf_out.stdout)
 
+    # getent uses the real glibc/NSS path applications use (unlike dig).
     - name: Verify | Resolve a test name through the local cache
       ansible.builtin.command: "getent ahosts {{ dns_cache_test_hostname }}"
       register: getent_out
@@ -279,6 +298,7 @@
       delay: 2
       until: getent_out.rc == 0
 
+    # Per-host one-line summary: OS, mechanism, and lookup confirmation.
     - name: Report | Summarize what was configured
       ansible.builtin.debug:
         msg: >-
@@ -297,6 +317,7 @@
         name: NetworkManager.service
         state: reloaded
 
+    # Full restart required: resolved reads conf.d drop-ins only at startup.
     - name: Restart systemd-resolved
       ansible.builtin.systemd_service:
         name: systemd-resolved.service
